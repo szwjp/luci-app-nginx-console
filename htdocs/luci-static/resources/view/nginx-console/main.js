@@ -29,12 +29,24 @@
 var HELPER_RO = '/usr/libexec/nginx-console';
 var HELPER_RW = '/usr/libexec/nginx-console-write';
 
-var PENDING = '/tmp/nginx-console.pending';
+// The staged input and, in the access control view, a plain text password.  A
+// fixed path is not safe: two browser tabs stage into the same file, and the
+// later write wins while the earlier command still reads it, so one tab's
+// content lands under the other tab's name.  Each call therefore stages into
+// its own file, and the backend takes that exact path as an argument.
+var PENDING_DIR = '/tmp';
+var PENDING_PREFIX = 'nginx-console.pending.';
+var PENDING_MODE = 384; // 0600
 
-// The staged file holds the form input and, in the access control view, a
-// plain text password.  It is written with mode 0600 so no other account on
-// the router can read it while it waits for the backend.
-var PENDING_MODE = 0o600;
+// Sequence for the per-call staged file name: the pid-free part is the browser
+// tick so two rapid saves in the same tab still get distinct names.
+var pendingSeq = 0;
+
+function pendingPath() {
+	pendingSeq++;
+	return PENDING_DIR + '/' + PENDING_PREFIX + Date.now().toString(36) +
+		'-' + pendingSeq + '-' + Math.floor(Math.random() * 1e6).toString(36);
+}
 
 // The commands that change something.  Everything else only reports.
 var WRITE_COMMANDS = {
@@ -66,12 +78,17 @@ var callSessionAccess = rpc.declare({
 });
 
 function probeWriteAccess() {
+	var answer = function(r) { return { known: true, canWrite: !!(r && r.access) }; };
+
 	return callSessionAccess('access-group', 'luci-app-nginx-console', 'write')
-		.then(function(r) { return !!(r && r.access); })
+		.then(answer)
 		.catch(function() {
-			// The probe is a convenience: when it does not answer, the write
-			// actions stay visible and the backend refuses them.
-			return true;
+			// Failing open showed the delete and save buttons to a read-only
+			// session, and every click was then refused by rpcd with a message
+			// that pointed at the ACL.  Failing closed keeps the page honest:
+			// a session whose grant cannot be read is treated as read-only,
+			// and the backend refuses writes anyway.
+			return { known: false, canWrite: false };
 		});
 }
 
@@ -124,12 +141,31 @@ function serverLabel(name) {
 // The router ships a fragment that redirects every plain-http request to
 // https.  It is not a location block, so instead of showing it as "an
 // unrecognised fragment" the redirect tab drives it with one checkbox.
+// Values shared by more than one place.  Keeping them here stops the label in
+// the page from drifting away from the limit the backend enforces.
+var LOG_LINES = 200;              // nginx-console-lib.sh caps at 500
+var MAX_FRAG_KIB = 128;           // nginx-console-lib.sh MAX_FRAG_BYTES
+var MAX_UPLOAD_KIB = 256;         // nginx-console-lib.sh MAX_UPLOAD_BYTES
+var TEST_OUTPUT_PREVIEW = 200;    // characters shown inline for nginx -t output
+var CERT_WARN_DAYS = 30;
+var CERT_CRIT_DAYS = 7;
+
 var HTTPS_REDIRECT_FILE = '000-https-redirect.locations';
 var HTTPS_REDIRECT_LINE = 'if ($scheme = http) { return 301 https://$host$request_uri; }';
 var HTTPS_REDIRECT_RE = /^if\s*\(\s*\$scheme\s*=\s*http\s*\)\s*\{\s*return\s+30[0-9]\s+https:\/\/\$host\$request_uri\s*;\s*\}$/;
 
+// Whether a file is the redirect the checkbox drives.  Comments and blank
+// lines around the directive do not change what it does, so they are dropped
+// before the test: an exact whole-file match reported a commented file as "not
+// enabled" and the checkbox then overwrote the comment.
 function isHttpsRedirect(content) {
-	return HTTPS_REDIRECT_RE.test(String(content || '').trim());
+	var meaningful = String(content || '')
+		.split('\n')
+		.map(function(l) { return l.trim(); })
+		.filter(function(l) { return l && l.charAt(0) !== '#'; })
+		.join('');
+
+	return HTTPS_REDIRECT_RE.test(meaningful);
 }
 
 function buildHttpsRedirect() {
@@ -458,8 +494,9 @@ var ERR_TEXT = {
 	no_such_section: '该 server 段不存在',
 	not_found: '文件不存在',
 	empty: '内容为空',
-	too_large: '内容超过 128 KiB',
+	too_large: '内容超过 ' + MAX_FRAG_KIB + ' KiB',
 	pending_missing: '编辑内容没有传达到后端',
+	invalid_value: '提交的值不被接受（include 只能是配置目录内的路径，日志只能是 logd/syslog/off 或 /var/log/nginx/ 下的文件）',
 	snapshot_failed: '快照失败，已取消保存',
 	write_failed: '写入失败',
 	commit_failed: '写入 /etc/config/nginx 失败',
@@ -468,7 +505,19 @@ var ERR_TEXT = {
 	reload_failed: 'nginx 重载失败，已回滚',
 	exec_failed: '无法执行后端脚本（检查 ACL 或 /usr/libexec/nginx-console）',
 	bad_reply: '后端返回内容无法解析',
-	unknown_command: '未知命令'
+	unknown_command: '未知命令',
+	already_exists: '同名的段已存在',
+	protected_section: '该段受保护，不能删除',
+	invalid_user: '用户名不合法（只允许字母、数字和 _ . -）',
+	empty_password: '密码不能为空',
+	hash_failed: '密码哈希生成失败',
+	permission_denied: '当前账号没有写权限',
+	no_such_user: '该用户不存在',
+	no_such_backup: '该备份不存在',
+	bad_backup_path: '备份路径不合法',
+	bad_backup_name: '备份文件名不合法',
+	bad_source: '日志来源不合法',
+	unknown_action: '未知操作'
 };
 
 function errText(r) {
@@ -507,6 +556,31 @@ function asList(value) {
 	return Array.isArray(value) ? value : [ value ];
 }
 
+// Stages one command's input into its own file and runs the helper against that
+// exact path.  The file is removed in both outcomes, so a password or a key is
+// not left behind when the command is refused or the page goes away.
+function stageAndCall(content, args) {
+	var path = pendingPath();
+	var argv = args.concat([ path ]);
+
+	return fs.write(path, String(content == null ? '' : content), PENDING_MODE)
+		.catch(function() {
+			// A leftover from an earlier run may exist with another mode:
+			// remove it and write again, so the mode is the one asked for.
+			return fs.remove(path).then(function() {
+				return fs.write(path, String(content == null ? '' : content), PENDING_MODE);
+			});
+		})
+		.then(function() { return callHelper(argv); })
+		.then(function(r) {
+			fs.remove(path).catch(function() {});
+			return r;
+		}, function(e) {
+			fs.remove(path).catch(function() {});
+			return { ok: false, error: 'exec_failed', output: (e && e.message) || String(e) };
+		});
+}
+
 function fmtSize(n) {
 	n = Number(n) || 0;
 	return n < 1024 ? n + ' B' : (n / 1024).toFixed(1) + ' KiB';
@@ -524,13 +598,38 @@ function fmtTime(ts) {
 		' ' + p(d.getHours()) + ':' + p(d.getMinutes());
 }
 
+// Whether an add_header value starts with exactly this header name.  A prefix
+// test would also match X-Frame-Options-Report-Only, which is a different
+// header, so the name has to end at a space or at the end of the value.
+function isHeaderNamed(value, name) {
+	var v = String(value || '').trim();
+
+	if (v.length < name.length || v.slice(0, name.length).toLowerCase() !== name.toLowerCase())
+		return false;
+
+	return v.length === name.length || /\s/.test(v.charAt(name.length));
+}
+
+// Ports of one section, for the chip label.  The port is the number that
+// follows the last colon (or the only number when no address is given): taking
+// the first number in the value printed 127 for "127.0.0.1:8080".
+// The audit level decides the icon and colour, so an unexpected value from the
+// backend is mapped to a known one instead of being used as a class name.
+function findingLevel(f) {
+	var l = String((f && f.level) || '');
+
+	return (l === 'warn' || l === 'error') ? l : 'info';
+}
+
 function portsOf(section) {
 	var seen = {};
 
 	asList(section.listen).forEach(function(l) {
-		var m = /(^|[^0-9])([0-9]{1,5})([^0-9]|$)/.exec(String(l));
+		var v = String(l);
+		var m = /:(\d{1,5})(?:\s|$)/.exec(v) || /^(\d{1,5})(?:\s|$)/.exec(v);
+
 		if (m)
-			seen[m[2]] = true;
+			seen[m[1]] = true;
 	});
 
 	return Object.keys(seen).join(' ');
@@ -592,6 +691,104 @@ function balancedBlock(text, open) {
 	return null;
 }
 
+// Strips a `#` comment from one line.  A `#` inside a quoted string is content,
+// not a comment, so the quotes are tracked.
+function stripComment(line) {
+	var out = '', quote = '';
+
+	for (var i = 0; i < line.length; i++) {
+		var ch = line.charAt(i);
+
+		if (quote) {
+			out += ch;
+			if (ch === quote)
+				quote = '';
+		}
+		else if (ch === '"' || ch === "'") {
+			quote = ch;
+			out += ch;
+		}
+		else if (ch === '#')
+			break;
+		else
+			out += ch;
+	}
+
+	return out;
+}
+
+// Net brace count of one line, ignoring braces inside quoted strings.
+function braceDelta(line) {
+	var d = 0, quote = '';
+
+	for (var i = 0; i < line.length; i++) {
+		var ch = line.charAt(i);
+
+		if (quote) {
+			if (ch === quote)
+				quote = '';
+			continue;
+		}
+		if (ch === '"' || ch === "'") {
+			quote = ch;
+			continue;
+		}
+		if (ch === '{')
+			d++;
+		else if (ch === '}')
+			d--;
+	}
+
+	return d;
+}
+
+// Splits a location body into its first-level lines and its nested blocks.
+// Nested blocks (an "if", a nested location) are kept whole as one entry so a
+// scan for a directive never reaches inside them: a proxy_pass under an `if`
+// belongs to that condition and is not the block's own backend.
+// Returns null when a block never closes, so the caller can fall back instead
+// of guessing at the structure.
+function splitTopLevel(inner) {
+	var lines = String(inner || '').split('\n');
+	var out = [];
+	var block = null, depth = 0;
+
+	for (var i = 0; i < lines.length; i++) {
+		var raw = lines[i];
+		var l = stripComment(raw).trim();
+
+		if (block !== null) {
+			block.push(raw);
+			depth += braceDelta(l);
+
+			if (depth <= 0) {
+				out.push({ block: block.join('\n').trim() });
+				block = null;
+				depth = 0;
+			}
+			continue;
+		}
+
+		if (!l)
+			continue;
+
+		var d = braceDelta(l);
+
+		if (d > 0) {
+			block = [ raw ];
+			depth = d;
+			continue;
+		}
+
+		out.push({ line: l });
+	}
+
+	if (block !== null)
+		return null;
+
+	return out;
+}
+
 // True when the text holds nothing but blank lines and comments.
 function onlyComments(text) {
 	var lines = String(text || '').split('\n');
@@ -640,12 +837,18 @@ function unmodelledLines(inner, isModelled, firstOnly) {
 // a save never throws content away.
 function parseLocationFragment(content) {
 	var c = String(content || '');
-	var blocks = c.match(/location\s+(?:=[\s]*)?[^\s{]*\s*\{/g);
+	// Count every location block, whatever modifier it carries, so a file with
+	// two of them is refused instead of being treated as one.
+	var blocks = c.match(/location\s*(?:=[ \t]*|\^~[ \t]*|~\*[ \t]*|~[ \t]*)?[^\s{]*\s*\{/g);
 
 	if (!blocks || blocks.length !== 1)
 		return null;
 
-	var m = /location\s+(?:=\s*)?([^\s{]+)\s*\{/.exec(c);
+	// The modifier is part of the matching rule, not decoration: `= /x` is an
+	// exact match while `/x` is a prefix match that also catches /x/anything.
+	// It is captured so a rebuild writes the same rule back; dropping it would
+	// silently widen the scope of the block with `nginx -t` still passing.
+	var m = /location\s*(=[ \t]*|\^~[ \t]*|~\*[ \t]*|~[ \t]*)?([^\s{]+)\s*\{/.exec(c);
 
 	if (!m)
 		return null;
@@ -668,7 +871,22 @@ function parseLocationFragment(content) {
 	if (!onlyComments(head) || !onlyComments(tail))
 		return null;
 
-	return { path: m[1], inner: blk.inner, head: head, tail: tail };
+	return {
+		modifier: (m[1] || '').replace(/[ \t]+$/, ''),
+		path: m[2],
+		inner: blk.inner,
+		head: head,
+		tail: tail
+	};
+}
+
+// "location = /x {" / "location /x {" depending on whether the parsed block
+// carried a modifier.  Every build*Fragment writes its block through this so no
+// kind can lose the modifier on its own.
+function locationHead(loc, path) {
+	var modifier = String(loc && loc.modifier || '').trim();
+
+	return 'location ' + (modifier ? modifier + ' ' : '') + path + ' {';
 }
 
 function directiveValue(body, name) {
@@ -686,20 +904,52 @@ function parseProxyFragment(content) {
 	if (!loc)
 		return null;
 
-	var pm = /proxy_pass\s+([^;]+);/.exec(loc.inner);
+	// Only the block's own directives count.  A proxy_pass inside an `if` is
+	// conditional and must not be mistaken for the backend of the whole block,
+	// so the body is split into first-level lines and opaque nested blocks.
+	var parts = splitTopLevel(loc.inner);
+
+	if (!parts)
+		return null;
+
+	var passes = parts.filter(function(p) {
+		return p.line && /^proxy_pass\s/.test(p.line);
+	});
+
+	// Two first-level proxy_pass directives cannot be described by a single
+	// form field: the text editor keeps them instead of guessing.
+	if (passes.length !== 1)
+		return null;
+
+	var pm = /^proxy_pass\s+([^;]+);/.exec(passes[0].line);
 
 	if (!pm)
 		return null;
 
-	var websocket = /^[ \t]*proxy_set_header\s+upgrade\b/im.test(loc.inner);
+	var websocket = parts.some(function(p) {
+		return p.line && /^proxy_set_header\s+upgrade\b/i.test(p.line);
+	});
+
+	// The Host header is a form field of its own: it is read here so a hand
+	// written value survives a save instead of being replaced by the default.
+	var host = '$host';
+
+	parts.forEach(function(p) {
+		var hm = p.line && /^proxy_set_header\s+host\s+(.+);$/i.exec(p.line);
+		if (hm)
+			host = hm[1].trim();
+	});
 
 	var extra = [], wsLines = [];
 
-	String(loc.inner || '').split('\n').forEach(function(line) {
-		var l = line.trim();
-
-		if (!l)
+	parts.forEach(function(p) {
+		// A nested block is never modelled: it goes back out unchanged.
+		if (p.block) {
+			extra.push(p.block);
 			return;
+		}
+
+		var l = p.line;
 
 		if (PROXY_MODELLED.some(function(re) { return re.test(l); }))
 			return;
@@ -714,8 +964,10 @@ function parseProxyFragment(content) {
 	});
 
 	return {
+		modifier: loc.modifier,
 		path: loc.path,
 		target: pm[1].trim(),
+		host: host,
 		websocket: websocket,
 		wsLines: wsLines,
 		connectTimeout: directiveValue(loc.inner, 'proxy_connect_timeout'),
@@ -732,9 +984,9 @@ function buildProxyFragment(f) {
 
 	commentLines(f.head).forEach(function(l) { lines.push(l); });
 
-	lines.push('location ' + f.path + ' {');
+	lines.push(locationHead(f, f.path));
 	lines.push('\tproxy_pass ' + f.target + ';');
-	lines.push('\tproxy_set_header Host $host;');
+	lines.push('\tproxy_set_header Host ' + (f.host || '$host') + ';');
 
 	if (f.websocket) {
 		var ws = (f.wsLines && f.wsLines.length) ? f.wsLines : [
@@ -772,14 +1024,8 @@ function fragmentNameFromPath(path) {
 	return (s || 'proxy') + '.locations';
 }
 
-// Shared shape check for the two simple kinds: exactly one location block,
-// from which the caller pulls its own directive.
-function singleLocationBody(content) {
-	return parseLocationFragment(content);
-}
-
 function parseRedirectFragment(content) {
-	var loc = singleLocationBody(content);
+	var loc = parseLocationFragment(content);
 
 	if (!loc)
 		return null;
@@ -790,6 +1036,7 @@ function parseRedirectFragment(content) {
 		return null;
 
 	return {
+		modifier: loc.modifier,
 		path: loc.path,
 		code: rm[1],
 		target: rm[2].trim(),
@@ -806,7 +1053,7 @@ function buildRedirectFragment(f) {
 
 	commentLines(f.head).forEach(function(l) { lines.push(l); });
 
-	lines.push('location ' + f.path + ' {');
+	lines.push(locationHead(f, f.path));
 	lines.push('\treturn ' + f.code + ' ' + f.target + ';');
 
 	String(f.extra || '').split('\n').forEach(function(l) {
@@ -830,7 +1077,7 @@ var FORWARD_PROTOS = [
 ];
 
 function parseForwardFragment(content) {
-	var loc = singleLocationBody(content);
+	var loc = parseLocationFragment(content);
 
 	if (!loc)
 		return null;
@@ -873,6 +1120,7 @@ function parseForwardFragment(content) {
 	});
 
 	return {
+		modifier: loc.modifier,
 		path: loc.path,
 		proto: proto,
 		target: pm[2].trim(),
@@ -889,7 +1137,7 @@ function buildForwardFragment(f) {
 
 	commentLines(f.head).forEach(function(l) { lines.push(l); });
 
-	lines.push('location ' + f.path + ' {');
+	lines.push(locationHead(f, f.path));
 
 	var include = f.include || (proto ? proto.include : '');
 
@@ -1087,8 +1335,7 @@ function openPicker(title, filter, current, onPick) {
 			// The file name is not trusted: the backend checks it against a
 			// whitelist, installs the file itself and picks the mode the
 			// content asks for (a private key stays readable for root only).
-			fs.write(PENDING, String(reader.result), PENDING_MODE)
-				.then(function() { return callHelper([ 'upload', String(f.name || '') ]); })
+			stageAndCall(String(reader.result), [ 'upload', String(f.name || '') ])
 				.then(function(r) {
 					r = r || {};
 
@@ -1194,7 +1441,12 @@ return view.extend({
 		var status = data[1] || {};
 		var servers = uci.sections('nginx', 'server') || [];
 		var fragments = data[2] || [];
-		var canWrite = data[3] !== false;
+		// data[3] is the write probe: { known, canWrite }.  An unknown grant
+		// counts as read-only, so the page never offers an action the backend
+		// will refuse.
+		var access = data[3] || {};
+		var canWrite = access.canWrite === true;
+		var accessUnknown = access.known === false;
 
 		var activeTab = 'servers';            // 'servers' | 'fragments'
 		var activeServer = servers.length ? servers[0]['.name'] : null;
@@ -1205,6 +1457,15 @@ return view.extend({
 		var tabHost = E('div');
 		var subTabHost = E('div');
 		var contentHost = E('div', { 'class': 'ncs-main' });
+
+		// Rendering generation.  Tool views fetch asynchronously; switching
+		// tabs while a fetch is in flight used to let the older answer paint
+		// over the newer view.  Each paint takes a ticket and only the newest
+		// ticket is allowed to write.
+		var renderGen = 0;
+
+		function nextGen() { return ++renderGen; }
+		function isCurrent(gen) { return gen === renderGen; }
 		var resultHost = E('div');
 		var testBtn = E('button', { 'class': 'ncs-btn', 'click': function() { runTest(); } },
 			[ '测试配置' ]);
@@ -1346,8 +1607,7 @@ return view.extend({
 				// line, so neither direction can eat hand written content.
 				var work = enabled
 					? callHelper([ 'frag-delete', HTTPS_REDIRECT_FILE ])
-					: fs.write(PENDING, buildHttpsRedirect(), PENDING_MODE)
-						.then(function() { return callHelper([ 'frag-save', HTTPS_REDIRECT_FILE ]); });
+					: stageAndCall(buildHttpsRedirect(), [ 'frag-save', HTTPS_REDIRECT_FILE ]);
 
 				work.then(function(r) {
 					r = r || {};
@@ -1592,7 +1852,7 @@ return view.extend({
 
 				E('div', { 'class': 'ncs-sec' }, [
 					E('h3', {}, [ '安全与限流' ]),
-					readField('响应头', 'add_header', asList(sec.add_header).join('\n')),
+					readField('响应头', 'add_header', asList(sec.add_header)),
 					readField('版本号', 'server_tokens', sec.server_tokens),
 					readField('请求限速', 'limit_req', sec.limit_req),
 					readField('并发连接', 'limit_conn', sec.limit_conn)
@@ -1633,7 +1893,7 @@ return view.extend({
 				return {
 					spec: h,
 					sw: toggleSwitch(h.label, headerValues.some(function(v) {
-						return v.indexOf(h.name) === 0;
+						return isHeaderNamed(v, h.name);
 					}))
 				};
 			});
@@ -1641,7 +1901,7 @@ return view.extend({
 			// Anything already there that the checkboxes do not model stays
 			// visible and editable, so a save never drops it silently.
 			var extraHeaders = headerValues.filter(function(v) {
-				return !SECURITY_HEADERS.some(function(h) { return v.indexOf(h.name) === 0; });
+				return !SECURITY_HEADERS.some(function(h) { return isHeaderNamed(v, h.name); });
 			});
 			var extraHeaderBox = E('textarea', {
 				'class': 'ncs-frag-edit',
@@ -1680,7 +1940,13 @@ return view.extend({
 				{ value: '200', label: '200' },
 				{ value: '500', label: '500' }
 			];
-			var connRaw = String(sec.limit_conn || '').replace(/^ncs_cl\s+/, '');
+			// Only a value that already uses the zone this console owns can be
+			// edited here.  A hand written foreign zone is shown as-is and
+			// left alone: rewriting it to ncs_cl would silently change which
+			// zone is policed.
+			var connValue = String(sec.limit_conn || '').trim();
+			var connOwnZone = connValue === '' || /^ncs_cl\s+/.test(connValue);
+			var connRaw = connOwnZone ? connValue.replace(/^ncs_cl\s+/, '') : '';
 			var connSlider = valueSlider(CONN_LIMITS, connRaw, { empty: '不限' });
 
 			function collectHeaders() {
@@ -1743,10 +2009,15 @@ return view.extend({
 				lines.push('limit_req\t' + String(limitReqSeg.value() || ''));
 
 				var connNum = connSlider.value().replace(/[^0-9]/g, '');
-				lines.push('limit_conn\t' + (connNum ? 'ncs_cl ' + connNum : ''));
 
-				fs.write(PENDING, lines.join('\n') + '\n', PENDING_MODE)
-					.then(function() { return callHelper([ 'server-save', name ]); })
+				// A foreign zone is not modelled: it is carried through
+				// unchanged instead of being rewritten to ncs_cl.
+				if (!connOwnZone)
+					lines.push('limit_conn\t' + connValue);
+				else
+					lines.push('limit_conn\t' + (connNum ? 'ncs_cl ' + connNum : ''));
+
+				stageAndCall(lines.join('\n') + '\n', [ 'server-save', name ])
 					.then(function(r) {
 						r = r || {};
 
@@ -1895,8 +2166,7 @@ return view.extend({
 				deleteBtn.disabled = true;
 				saveBtn.textContent = '保存中…';
 
-				fs.write(PENDING, area.value, PENDING_MODE)
-					.then(function() { return callHelper([ 'frag-save', entry.name ]); })
+				stageAndCall(area.value, [ 'frag-save', entry.name ])
 					.then(function(r) {
 						r = r || {};
 
@@ -2197,8 +2467,7 @@ return view.extend({
 			cancelBtn.disabled = true;
 			saveBtn.textContent = '保存中…';
 
-			fs.write(PENDING, content, PENDING_MODE)
-				.then(function() { return callHelper([ 'frag-save', entry.name ]); })
+			stageAndCall(content, [ 'frag-save', entry.name ])
 				.then(function(r) {
 					r = r || {};
 
@@ -2348,27 +2617,35 @@ return view.extend({
 		}
 
 		function renderTool(id) {
+			// Every tool view fetches asynchronously.  The ticket is taken here
+			// so a late answer from a view the user already left can tell it is
+			// stale and drop itself instead of painting over the current one.
+			var gen = nextGen();
+
 			if (id === 'logs')
-				renderLogsView(lastLogSource);
+				renderLogsView(lastLogSource, gen);
 			else if (id === 'certs')
-				renderCertsView();
+				renderCertsView(gen);
 			else if (id === 'backups')
-				renderBackupsView();
+				renderBackupsView(gen);
 			else if (id === 'auth')
-				renderAuthView();
+				renderAuthView(gen);
 			else
-				renderAuditView();
+				renderAuditView(gen);
 		}
 
 		// ---- 日志
 
-		function renderLogsView(which) {
+		function renderLogsView(which, gen) {
 			which = which || 'error';
 			lastLogSource = which;
 
 			toolLoading('日志');
 
-			callHelper([ 'logs', which, '200' ]).then(function(r) {
+			callHelper([ 'logs', which, String(LOG_LINES) ]).then(function(r) {
+				if (gen != null && !isCurrent(gen))
+					return;
+
 				r = r || {};
 
 				if (r.ok === false) {
@@ -2401,10 +2678,13 @@ return view.extend({
 
 		// ---- 证书
 
-		function renderCertsView() {
+		function renderCertsView(gen) {
 			toolLoading('证书');
 
 			callHelper([ 'certs' ]).then(function(r) {
+				if (gen != null && !isCurrent(gen))
+					return;
+
 				r = r || {};
 
 				if (r.ok === false) {
@@ -2463,10 +2743,13 @@ return view.extend({
 
 		// ---- 备份
 
-		function renderBackupsView() {
+		function renderBackupsView(gen) {
 			toolLoading('备份');
 
 			callHelper([ 'backups', 'list' ]).then(function(r) {
+				if (gen != null && !isCurrent(gen))
+					return;
+
 				r = r || {};
 
 				if (r.ok === false) {
@@ -2546,10 +2829,13 @@ return view.extend({
 
 		// ---- 访问控制（htpasswd）
 
-		function renderAuthView() {
+		function renderAuthView(gen) {
 			toolLoading('访问控制');
 
 			callHelper([ 'auth', 'list' ]).then(function(r) {
+				if (gen != null && !isCurrent(gen))
+					return;
+
 				r = r || {};
 
 				if (r.ok === false) {
@@ -2565,7 +2851,7 @@ return view.extend({
 							'class': 'ncs-btn primary',
 							'click': function() { askAuthUser(null); }
 						}, [ '+ 新增用户' ]) : '',
-						E('button', { 'class': 'ncs-btn', 'click': renderAuthView }, [ '刷新' ])
+						E('button', { 'class': 'ncs-btn', 'click': function() { renderAuthView(nextGen()); } }, [ '刷新' ])
 					]),
 					E('div', { 'class': 'ncs-sec' }, [
 						E('p', { 'class': 'ncs-hint' }, [
@@ -2625,8 +2911,7 @@ return view.extend({
 				feedback.style.display = 'none';
 
 				// The password travels in the staged file, not as an argument.
-				fs.write(PENDING, p + '\n', PENDING_MODE)
-					.then(function() { return callHelper([ 'auth', 'set', u ]); })
+				stageAndCall(p + '\n', [ 'auth', 'set', u ])
 					.then(function(r) {
 						r = r || {};
 
@@ -2700,10 +2985,13 @@ return view.extend({
 
 		// ---- 体检
 
-		function renderAuditView() {
+		function renderAuditView(gen) {
 			toolLoading('体检');
 
 			callHelper([ 'audit' ]).then(function(r) {
+				if (gen != null && !isCurrent(gen))
+					return;
+
 				r = r || {};
 
 				if (r.ok === false) {
@@ -2718,9 +3006,9 @@ return view.extend({
 				}
 
 				toolShell('体检', '检查 nginx -t 查不出来的问题', [
-					E('button', { 'class': 'ncs-btn', 'click': renderAuditView }, [ '重新检查' ])
+					E('button', { 'class': 'ncs-btn', 'click': function() { renderAuditView(nextGen()); } }, [ '重新检查' ])
 				], items.length ? E('div', {}, items.map(function(f) {
-					return E('div', { 'class': 'ncs-find ' + (f.level || 'info') }, [
+					return E('div', { 'class': 'ncs-find ' + findingLevel(f) }, [
 						E('span', { 'class': 'ic' }, [ icon(f.level) ]),
 						E('div', {}, [
 							E('div', { 'class': 'ti' }, [ f.title ]),
@@ -2819,8 +3107,7 @@ return view.extend({
 				cancelBtn.disabled = true;
 				saveBtn.textContent = '保存中…';
 
-				fs.write(PENDING, buildProxyFragment(v), PENDING_MODE)
-					.then(function() { return callHelper([ 'frag-save', entry.name ]); })
+				stageAndCall(buildProxyFragment(v), [ 'frag-save', entry.name ])
 					.then(function(r) {
 						r = r || {};
 
@@ -2914,8 +3201,7 @@ return view.extend({
 				createBtn.disabled = true;
 				feedback.style.display = 'none';
 
-				fs.write(PENDING, buildProxyFragment(v), PENDING_MODE)
-					.then(function() { return callHelper([ 'frag-save', name ]); })
+				stageAndCall(buildProxyFragment(v), [ 'frag-save', name ])
 					.then(function(r) {
 						r = r || {};
 
@@ -2960,7 +3246,7 @@ return view.extend({
 
 		function openNewServer() {
 			var nameIn = E('input', { 'class': 'ncs-input', 'placeholder': '例如 mysite' });
-			var listenIn = E('input', { 'class': 'ncs-input', 'placeholder': '例如 8443 ssl' });
+			var listenIn = E('input', { 'class': 'ncs-input', 'placeholder': '例如 8080 或 10.0.0.1:8080' });
 			var serverNameIn = E('input', { 'class': 'ncs-input', 'placeholder': '例如 example.com' });
 			var feedback = E('p', { 'style': 'display:none;color:#e08585;margin:10px 0 0' }, [ '' ]);
 			var createBtn = E('button', { 'class': 'ncs-btn primary' }, [ '创建' ]);
@@ -2994,7 +3280,7 @@ return view.extend({
 				// and collide with _redirect2ssl, so it is required here.
 				if (!listen) {
 					feedback.style.display = '';
-					feedback.textContent = '必须填一条 listen，例如 8443 ssl 或 8080。';
+					feedback.textContent = '必须填一条 listen，例如 8080 或 10.0.0.1:8080。新建后可在编辑里补证书再开 ssl。';
 					return;
 				}
 
@@ -3005,8 +3291,7 @@ return view.extend({
 				createBtn.disabled = true;
 				feedback.style.display = 'none';
 
-				fs.write(PENDING, lines.join('\n') + '\n', PENDING_MODE)
-					.then(function() { return callHelper([ 'server-add', name ]); })
+				stageAndCall(lines.join('\n') + '\n', [ 'server-add', name ])
 					.then(function(r) {
 						r = r || {};
 
@@ -3158,7 +3443,13 @@ return view.extend({
 				ui.hideModal();
 
 				var existing = findFragment(name);
-				activeTab = 'fragments';
+
+				// 'fragments' is not a tab: switching to it left no chip
+				// highlighted and hid the new entry from every kind filter.
+				// A new fragment is unclassified, so it opens under "其他".
+				if (!existing)
+					activeTab = 'other';
+
 				activeFrag = name;
 				editing = true;
 
@@ -3205,7 +3496,7 @@ return view.extend({
 						'状态读取失败：' + (status.error || 'unknown'),
 						status.output
 							? E('code', { 'style': 'margin-left:8px;color:#8d8d8d' },
-								[ String(status.output).trim().slice(0, 200) ])
+								[ String(status.output).trim().slice(0, TEST_OUTPUT_PREVIEW) ])
 							: ''
 					])
 					: E('span', {}, [
@@ -3213,10 +3504,14 @@ return view.extend({
 						status.running ? '运行中' : '未运行'
 					]),
 				status.version ? E('span', {}, [ E('span', { 'class': 'k' }, [ '版本 ' ]), status.version ]) : '',
+				// Counts come from the lists the page holds, not from the
+				// status snapshot: that snapshot is read once at load, so
+				// saving a section left the number stale and looked like the
+				// save had failed.
 				E('span', {}, [ E('span', { 'class': 'k' }, [ 'server 段 ' ]),
-					String(status.servers == null ? servers.length : status.servers) ]),
+					String(servers.length) ]),
 				E('span', {}, [ E('span', { 'class': 'k' }, [ '片段 ' ]),
-					String(status.fragments == null ? fragments.length : status.fragments) ]),
+					String(fragments.length) ]),
 				typeof status.workers === 'number'
 					? E('span', {}, [ E('span', { 'class': 'k' }, [ 'worker ' ]), String(status.workers) ])
 					: '',
@@ -3224,7 +3519,9 @@ return view.extend({
 			]),
 
 			canWrite ? '' : E('div', { 'class': 'ncs-ro' }, [
-				'当前账号只有只读权限：可以查看配置与状态，修改相关的按钮已隐藏。'
+				accessUnknown
+					? '无法确认当前账号的写权限（权限查询没有响应），因此按只读处理：修改相关的按钮已隐藏。'
+					: '当前账号只有只读权限：可以查看配置与状态，修改相关的按钮已隐藏。'
 			]),
 
 			resultHost,

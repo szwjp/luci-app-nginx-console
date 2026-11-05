@@ -157,7 +157,7 @@ cp /tmp/${NAME}-post-install /tmp/${NAME}-post-upgrade
 	--info "origin:https://github.com/szwjp/${NAME}" \
 	--info "url:https://github.com/szwjp/${NAME}" \
 	--info "maintainer:szwjp <szwjp@users.noreply.github.com>" \
-	--info "depends:luci-base rpcd rpcd-mod-file nginx" \
+	--info "depends:luci-base rpcd rpcd-mod-file jsonfilter nginx" \
 	--script "post-install:/tmp/${NAME}-post-install" \
 	--script "post-upgrade:/tmp/${NAME}-post-upgrade" \
 	--files "\$PKG" \

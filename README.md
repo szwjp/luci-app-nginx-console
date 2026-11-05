@@ -85,7 +85,7 @@ uci commit rpcd && /etc/init.d/rpcd restart
 
 ## 写操作的统一约定
 
-前端只读 + 写暂存文件（`/tmp/nginx-console.pending`，模式 0600），落盘由 `/usr/libexec/nginx-console-write` 完成。每个写操作固定走同一条路：
+前端只读 + 写暂存文件（每次调用一个 `/tmp/nginx-console.pending.<随机>`，模式 0600，命令结束即删），落盘由 `/usr/libexec/nginx-console-write` 完成。后端把命令最后那个参数当作暂存文件路径，并只接受匹配 `nginx-console.pending.<id>` 的路径——两个标签页同时保存时不会互相覆盖，路径也不能指向暂存区以外。每个写操作固定走同一条路：
 
 ```
 备份 → 写入 → （server 段还要 commit + 重新渲染 uci.conf）→ nginx -t
@@ -95,6 +95,7 @@ uci commit rpcd && /etc/init.d/rpcd restart
 
 几条刻意的设计：
 
+- **选项值不经 shell**：读当前值时用 `ubus call uci get` + `jsonfilter` 取结构化列表，不再 `eval` `uci get` 的文本输出——后者会把配置里的 `$(...)` 当命令执行
 - **字段白名单**：`server-save` 只碰 `listen`、`server_name`、`include`、两个证书字段、两个日志字段、`add_header`、`server_tokens`、`limit_req`、`limit_conn`，其余（`uci_manage_ssl`、会话缓存等）原样不动
 - **只碰暂存到的字段**：暂存文件里没带的字段一律不碰（空值和"没这个字段"是两回事）；要清空一个列表字段，表单会明确写一行空值过去
 - **值没变的字段连位置都不会动**
@@ -125,6 +126,8 @@ auth set|delete [user]          htpasswd 管理（密码从 pending 读）
 ```
 
 每个命令都只输出一个 JSON 对象并 `exit 0`，调用方不用解释退出码。`upload` 的文件名要过白名单，私钥落盘是 0600。
+
+`include` 与 `access_log` / `error_log` 的值在后端还有一层校验（`nginx -t` 本身不拦这两类路径）：`include` 只允许配置目录内的相对路径，日志只允许 `logd` / `syslog` / `off` / `/var/log/nginx/` 下的文件。不合规的提交返回 `invalid_value`。
 
 ## 目录
 

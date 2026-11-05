@@ -3,7 +3,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-nginx-console
-PKG_VERSION:=0.6.2
+PKG_VERSION:=0.7.0
 PKG_RELEASE:=1
 
 PKG_MAINTAINER:=szwjp <szwjp@users.noreply.github.com>
@@ -18,8 +18,9 @@ LUCI_DESCRIPTION:=Browse the server sections of /etc/config/nginx in a \
 LUCI_PKGARCH:=all
 # nginx is a virtual package provided by nginx-ssl, nginx-full and friends.
 # The console calls its backend through rpcd's file.exec, so rpcd-mod-file is
-# what it needs - not cgi-io.
-LUCI_DEPENDS:=+luci-base +rpcd +rpcd-mod-file +nginx
+# what it needs - not cgi-io.  jsonfilter decodes the uci list values without
+# invoking a shell, which is what keeps option values from being executed.
+LUCI_DEPENDS:=+luci-base +rpcd +rpcd-mod-file +jsonfilter +nginx
 
 include $(TOPDIR)/feeds/luci/luci.mk
 

@@ -27,8 +27,9 @@ MAINTAINER="szwjp <szwjp@users.noreply.github.com>"
 
 # apk dependency list: space separated, no leading '+' like the Makefile has.
 # The console calls its backend through rpcd's file.exec, so rpcd-mod-file is
-# what it needs - not cgi-io.
-DEPENDS="luci-base rpcd rpcd-mod-file nginx"
+# what it needs - not cgi-io.  jsonfilter decodes the uci list values without
+# invoking a shell, which is what keeps option values from being executed.
+DEPENDS="luci-base rpcd rpcd-mod-file jsonfilter nginx"
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 OUT_DIR="${1:-${REPO_DIR}/dist}"

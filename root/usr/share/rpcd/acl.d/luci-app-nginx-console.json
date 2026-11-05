@@ -19,7 +19,7 @@
 		"write": {
 			"file": {
 				"/usr/libexec/nginx-console-write": [ "exec" ],
-				"/tmp/nginx-console.pending": [ "write" ]
+				"/tmp/nginx-console.pending.*": [ "write", "read", "remove" ]
 			}
 		}
 	}

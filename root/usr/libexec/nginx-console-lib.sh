@@ -19,6 +19,12 @@ NGINX_BIN=/usr/sbin/nginx
 NGINX_INIT=/etc/init.d/nginx
 NGINX_UTIL=/usr/bin/nginx-util
 PENDING=/tmp/nginx-console.pending
+# The page stages each command into its own file so two tabs cannot overwrite
+# each other's input, and passes that path as the command's last argument.  Only
+# names matching this pattern are accepted: the path is used for reading and
+# deleting, so it must not be able to point outside the staging area.
+PENDING_PATH_PATTERN='^/tmp/nginx-console[.]pending[.][A-Za-z0-9_-]+$'
+PENDING_PATH=''
 SNAPSHOT=/tmp/nginx-console.snapshot
 UPLOAD_DIR=/etc/luci-uploads
 MAX_UPLOAD_BYTES=262144
@@ -42,6 +48,24 @@ TAB="$(printf '\t')"
 . /usr/share/libubox/jshn.sh
 
 # ---------------------------------------------------------------- utilities
+
+# Adopts the staged file named by the command's staging argument.  A command
+# that reads staged input takes that path as its last argument; the pattern
+# check keeps the value from naming anything outside the staging area, because
+# this path is read and then deleted.
+#   set_pending <path>  - returns 1 when the argument is not an allowed path
+set_pending() {
+	PENDING_PATH=''
+
+	[ -n "${1:-}" ] || return 1
+
+	printf '%s' "$1" | grep -qE "$PENDING_PATH_PATTERN" || return 1
+
+	PENDING_PATH="$1"
+	PENDING="$PENDING_PATH"
+
+	return 0
+}
 
 nginx_running() {
 	local pid
@@ -130,16 +154,59 @@ field_present() {
 }
 
 uci_current_values() {
-	# `uci -q get` prints a list shell-quoted ('v1' 'v2' ...), and it only adds
-	# the quotes when a value needs them.  Rather than guessing at those rules,
-	# let the shell do the splitting: the output is designed to be evaled.
-	local name="$1" v
+	# All current values of one option, one per line.
+	#
+	# This used to be `eval "set -- $(uci -q get ...)"`, which split the list
+	# with the shell.  That is a command injection: `uci get` only quotes a
+	# value when it needs quoting, so a value like `$(cmd)` printed bare and the
+	# eval ran it as root.  The ubus uci interface returns the list as JSON
+	# instead, and jsonfilter decodes it without invoking a shell, so the value
+	# stays a literal string no matter what it contains.
+	local name="$1" config section option
 
-	eval "set -- $(uci -q get "$name" 2>/dev/null)" 2>/dev/null || return 0
+	config="${name%%.*}"
+	section="${name#*.}"
+	section="${section%%.*}"
+	option="${name##*.}"
 
-	for v in "$@"; do
-		printf '%s\n' "$v"
-	done
+	[ -n "$config" ] && [ -n "$section" ] && [ -n "$option" ] || return 0
+
+	ubus call uci get "{\"config\":\"$config\",\"section\":\"$section\",\"option\":\"$option\"}" 2>/dev/null \
+		| jsonfilter -e '@.value[*]' 2>/dev/null
+
+	return 0
+}
+
+# Path values the form may write.  `nginx -t` alone is not a guard here: it
+# accepts any readable file for include and any path for access_log, so a write
+# grant could point nginx at a file outside its configuration.  Both are
+# restricted to the shapes this router actually uses.
+valid_include() {
+	printf '%s' "$1" | grep -qE '^[A-Za-z0-9_./*-]+$' || return 1
+	printf '%s' "$1" | grep -qE '(^|/)[.][.]/' && return 1
+	return 0
+}
+
+valid_log_target() {
+	case "$1" in
+		''|off|off\;*|logd*|syslog*) return 0 ;;
+		/var/log/nginx/*) return 0 ;;
+	esac
+
+	return 1
+}
+
+# Validates one staged value for the field it belongs to.  Fields without a
+# rule here are free-form nginx arguments.
+valid_field_value() {
+	local field="$1" value="$2"
+
+	case "$field" in
+		include)    valid_include "$value" || return 1 ;;
+		access_log|error_log) valid_log_target "$value" || return 1 ;;
+	esac
+
+	return 0
 }
 
 apply_editable() {
@@ -165,6 +232,8 @@ apply_editable() {
 		while IFS= read -r value; do
 			[ -n "$value" ] || continue
 
+			valid_field_value "$field" "$value" || return 2
+
 			if is_single "$field"; then
 				uci -q set "nginx.$name.$field=$value" || return 1
 			else
@@ -187,11 +256,20 @@ render_uci_conf() {
 	"$NGINX_UTIL" init_lan >/dev/null 2>&1
 }
 
+# Backup file stamp.  One-second resolution is not enough: two saves in the same
+# second wrote the same name and the earlier snapshot was overwritten, so the
+# pid is appended to keep them apart.  The date part stays first because
+# backup_entry() reads the creation time out of the name.
+backup_stamp() {
+	printf '%s-%s' "$(date '+%Y%m%d-%H%M%S')" "$$"
+}
+
+
 snapshot_uci() {
 	cp -p "$UCI_FILE" "$SNAPSHOT" || return 1
 
 	mkdir -p "$BACKUP_DIR" 2>/dev/null
-	cp -p "$UCI_FILE" "$BACKUP_DIR/$(date '+%Y%m%d-%H%M%S').nginx" 2>/dev/null
+	cp -p "$UCI_FILE" "$BACKUP_DIR/$(backup_stamp).nginx" 2>/dev/null
 	ls -1t "$BACKUP_DIR" 2>/dev/null \
 		| awk -v keep="$BACKUP_KEEP" 'NR > keep' \
 		| while read -r f; do
@@ -225,7 +303,7 @@ frag_backup() {
 
 	[ -f "$src" ] || return 1
 	mkdir -p "$FRAG_BACKUP_DIR" || return 1
-	dst="$FRAG_BACKUP_DIR/$(date '+%Y%m%d-%H%M%S').${src##*/}"
+	dst="$FRAG_BACKUP_DIR/$(backup_stamp).${src##*/}"
 	cp -p "$src" "$dst" || return 1
 
 	ls -1t "$FRAG_BACKUP_DIR" 2>/dev/null \
@@ -379,10 +457,11 @@ cmd_server_save() {
 	# Applies the edit form of one server section.  The values arrive in
 	# $PENDING as "field<TAB>value" lines and only EDITABLE_FIELDS are touched,
 	# so a save can never blank out certificates or log settings that the page
-	# does not understand yet.
+	# does not understand yet.  $2 is the staged file this call wrote.
 	local name="$1" field value out rc
 
 	valid_section "$name" || { json_fail invalid_section; return 0; }
+	set_pending "$2" || { json_fail pending_missing; return 0; }
 	uci -q get "nginx.$name" >/dev/null 2>&1 || { json_fail no_such_section; return 0; }
 	[ -f "$PENDING" ] || { json_fail pending_missing; return 0; }
 
@@ -391,7 +470,17 @@ cmd_server_save() {
 
 	snapshot_uci || { json_fail snapshot_failed; return 0; }
 
-	if ! apply_editable "$name"; then
+	apply_editable "$name"
+	rc=$?
+
+	if [ "$rc" -eq 2 ]; then
+		uci -q revert nginx 2>/dev/null
+		rm -f "$PENDING"
+		json_fail invalid_value
+		return 0
+	fi
+
+	if [ "$rc" -ne 0 ]; then
 		uci -q revert nginx 2>/dev/null
 		rm -f "$PENDING"
 		json_fail write_failed
@@ -440,6 +529,7 @@ cmd_frag_save() {
 	local name="$1" src dst backup out rc size
 
 	valid_frag_name "$name" || { json_fail invalid_name; return 0; }
+	set_pending "$2" || { json_fail pending_missing; return 0; }
 
 	src="$PENDING"
 	[ -f "$src" ] || { json_fail pending_missing; return 0; }
@@ -509,6 +599,7 @@ cmd_server_add() {
 	local name="$1" out rc
 
 	valid_section "$name" || { json_fail invalid_section; return 0; }
+	set_pending "$2" || { json_fail pending_missing; return 0; }
 	[ -f "$PENDING" ] || { json_fail pending_missing; return 0; }
 
 	if uci -q get "nginx.$name" >/dev/null 2>&1; then
@@ -526,7 +617,17 @@ cmd_server_add() {
 		return 0
 	}
 
-	if ! apply_editable "$name"; then
+	apply_editable "$name"
+	rc=$?
+
+	if [ "$rc" -eq 2 ]; then
+		uci -q revert nginx 2>/dev/null
+		rm -f "$PENDING"
+		json_fail invalid_value
+		return 0
+	fi
+
+	if [ "$rc" -ne 0 ]; then
 		uci -q revert nginx 2>/dev/null
 		rm -f "$PENDING"
 		json_fail write_failed
@@ -720,6 +821,7 @@ cmd_upload() {
 	local name="$1" src dst tmp mode size
 
 	[ -n "$name" ] || { json_fail invalid_name; return 0; }
+	set_pending "$2" || { json_fail pending_missing; return 0; }
 	printf '%s' "$name" | grep -qE "$UPLOAD_NAME_PATTERN" || {
 		json_fail invalid_name
 		return 0
@@ -814,7 +916,7 @@ valid_backup_path() {
 }
 
 cmd_backup_restore() {
-	local target="$1" out base current
+	local target="$1" out base current current_backup
 
 	valid_backup_path "$target" || { json_fail bad_backup_path; return 0; }
 	[ -f "$target" ] || { json_fail no_such_backup; return 0; }
@@ -894,6 +996,11 @@ cmd_auth() {
 	if [ "${AUTH_MODE:-rw}" = "ro" ] && [ "$action" != "list" ]; then
 		json_fail permission_denied
 		return 0
+	fi
+
+	# Only the writing actions read staged input ($3 is that file).
+	if [ "$action" != "list" ]; then
+		set_pending "$3" || { json_fail pending_missing; return 0; }
 	fi
 
 	case "$action" in
@@ -1000,7 +1107,7 @@ port_listening() {
 }
 
 cmd_audit() {
-	local secs sec sn seen dup f size inc val url host port days
+	local secs sec sn seen seen_keys dup f size inc val url host port days mode
 
 	json_init
 	json_add_boolean ok 1
@@ -1061,6 +1168,29 @@ EOF
 		[ -f "$f" ] || continue
 		size="$(wc -c < "$f" 2>/dev/null | tr -d ' ')"
 		[ "${size:-0}" -lt 2 ] && finding info '空的片段文件' "${f##*/} 没有任何内容"
+	done
+
+	# 4b. private keys that other accounts on the router can read.  nginx only
+	# needs root to read them, and a certificate directory that the console
+	# lists is where a bundled key is easy to leave world-readable.
+	seen_keys=''
+
+	for f in "$CONF_DIR"/*.key /etc/nginx/certs/*.key /etc/ssl/acme/*.key /etc/luci-uploads/*.key; do
+		[ -f "$f" ] || continue
+
+		# The same key can be matched by more than one directory, and a
+		# duplicate finding adds nothing.
+		case "$seen_keys" in
+			*"|$f|"*) continue ;;
+		esac
+		seen_keys="$seen_keys|$f|"
+
+		mode="$(ls -l "$f" 2>/dev/null | awk '{print $1}')"
+
+		case "$mode" in
+			??????---*)		;;	# no group/other bits: fine
+			*)			finding warn '私钥权限过宽' "${f##*/}（$mode）对 group/other 可读，建议 chmod 600" ;;
+		esac
 	done
 
 	# 5. include directives pointing at nothing
