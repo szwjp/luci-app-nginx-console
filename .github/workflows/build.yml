@@ -1,0 +1,145 @@
+name: Build
+
+# Manual release build.  The version comes from Makefile (PKG_VERSION /
+# PKG_RELEASE); triggering the same version again rebuilds it and replaces the
+# assets of that release.
+on:
+  workflow_dispatch:
+
+# Manual triggers may be fired back to back; queue instead of cancelling so a
+# release is never left half-updated.
+concurrency:
+  group: ${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  # Pinned tool versions, same apk-tools revision the other packages use.
+  APK_TOOLS_REF: b5a31c0d865342ad80be10d68f1bb3d3ad9b0866
+
+jobs:
+  build:
+    name: Build noarch apk & publish release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source tree
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Parse Makefile version
+        id: version
+        run: |
+          set -o pipefail
+          PKG_VERSION=$(sed -n 's/^PKG_VERSION:=//p' Makefile | head -n1 | tr -d '[:space:]')
+          PKG_RELEASE=$(sed -n 's/^PKG_RELEASE:=//p' Makefile | head -n1 | tr -d '[:space:]')
+          [ -n "$PKG_VERSION" ] && [ -n "$PKG_RELEASE" ]
+          {
+            echo "version=${PKG_VERSION}-r${PKG_RELEASE}"
+            echo "tag=v${PKG_VERSION}-r${PKG_RELEASE}"
+          } >> "$GITHUB_OUTPUT"
+          echo "::notice::Building v${PKG_VERSION}-r${PKG_RELEASE}"
+
+      - name: Checkout apk-tools
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          repository: alpinelinux/apk-tools
+          path: apk-tools
+          ref: ${{ env.APK_TOOLS_REF }}
+          fetch-depth: 1
+
+      # OpenWrt's apk-tools does not ship "apk mkpkg", so a full apk-tools is
+      # built here.  Nothing else from the SDK is needed: the package is
+      # architecture independent and contains only text files.
+      - name: Install build dependencies and build apk-tools
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -o pipefail
+          sudo -E apt-get update -qq
+          sudo -E apt-get install -y build-essential meson ninja-build libssl-dev pkg-config
+
+          meson setup apk-tools/build \
+            -Db_lto=true \
+            -Dcompressed-help=false \
+            -Ddocs=disabled \
+            -Dhelp=enabled \
+            -Ddefault_library=static \
+            -Durl_backend=wget \
+            -Dzstd=false \
+            -Dpython=disabled \
+            -Dtests=disabled \
+            -Dcrypto_backend=openssl
+          ninja -C apk-tools/build
+          sudo -E meson install -C apk-tools/build --strip
+
+          apk --version
+
+      - name: Build package
+        run: |
+          set -o pipefail
+          bash .github/build-pkg.sh dist
+
+      # Guards the packaging bug that is invisible in a log: an architecture
+      # independent package must carry apk's "noarch", not ipk's "all", and the
+      # version in the package must be the one the release is named after.
+      - name: Verify package metadata
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -o pipefail
+          set -- dist/*.apk
+          [ "$#" -eq 1 ] || { echo "::error::expected 1 apk, got $#"; exit 1; }
+
+          apk adbdump dist/*.apk
+          for pkg in dist/*.apk; do
+            echo "--- $pkg"
+            apk adbdump "$pkg" | grep -q '^  arch: noarch$'
+            apk adbdump "$pkg" | grep -q "^  name: luci-app-nginx-console$"
+            apk adbdump "$pkg" | grep -q "^  version: ${VERSION}$"
+            apk adbdump "$pkg" | grep -q 'usr/libexec/nginx-console'
+            apk adbdump "$pkg" | grep -q 'usr/libexec/nginx-console-write'
+            apk adbdump "$pkg" | grep -q 'usr/libexec/nginx-console-lib.sh'
+            apk adbdump "$pkg" | grep -q 'usr/share/rpcd/acl.d/luci-app-nginx-console.json'
+          done
+
+      - name: Prepare release notes
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -o pipefail
+          {
+            echo "架构无关（noarch）的 LuCI 应用包。"
+            echo
+            echo "## 安装（OpenWrt / ImmortalWrt，使用 apk 的系统）"
+            echo
+            echo '```sh'
+            echo "apk add --allow-untrusted luci-app-nginx-console-${VERSION}.apk"
+            echo '```'
+            echo
+            echo "包未签名，需要 \`--allow-untrusted\`。安装后菜单在 **服务 → Nginx 控制台**。"
+            echo
+            echo "这个包只读 /etc/config/nginx 与 /etc/nginx/conf.d，所有写操作都走"
+            echo "\`/usr/libexec/nginx-console-write\`：先备份，写入后跑 \`nginx -t\`，校验失败自动回滚。"
+            echo "只读命令在 \`/usr/libexec/nginx-console\`，两个入口的 rpcd 授权是分开的，"
+            echo "只有只读权限的账号碰不到写入口。"
+            echo
+            echo "## SHA-256"
+            echo
+            echo '```'
+            sha256sum dist/*.apk
+            echo '```'
+          } > dist/release-notes.md
+          cat dist/release-notes.md
+
+      - name: Publish release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.tag }}
+          body_path: dist/release-notes.md
+          files: dist/*.apk
+          # Re-triggering the same version replaces that release's assets.
+          overwrite_files: true
+          token: ${{ github.token }}
